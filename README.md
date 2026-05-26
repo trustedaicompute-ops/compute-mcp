@@ -1,0 +1,60 @@
+# ComputeID MCP Server
+
+Give Claude and any MCP-compatible AI the ability to issue cryptographic identities to AI agents natively.
+
+## What it does
+
+Once installed, Claude can:
+- **Issue AgentPassports** to any AI agent it spawns or works with
+- **Verify agent identity** before accepting work from another agent
+- **Log every action** to an immutable audit trail automatically
+- **Revoke agents instantly** if they behave unexpectedly
+- **Register GPU hardware** with cryptographic DevicePassports
+- **Generate compliance reports** for EU AI Act, SOC2, NIST AI RMF
+
+## Install
+
+```
+pip install computeid-mcp
+```
+
+## Configure Claude Desktop
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "computeid": {
+      "command": "python",
+      "args": ["-m", "computeid_mcp"],
+      "env": {
+        "COMPUTEID_API_URL": "https://api.aicomputeid.com",
+        "COMPUTEID_TOKEN": "your-token-here"
+      }
+    }
+  }
+}
+```
+
+## Tools available
+
+| Tool | Description |
+|------|-------------|
+| `computeid_status` | Check API health |
+| `issue_agent_passport` | Issue a cryptographic identity to an AI agent |
+| `verify_agent_passport` | Verify an agent's identity |
+| `log_agent_action` | Log an action to the immutable audit trail |
+| `revoke_agent_passport` | Instantly revoke an agent |
+| `list_agent_passports` | List all agents in your organisation |
+| `get_agent_audit_log` | Get full audit trail for an agent |
+| `register_device` | Register a GPU or server |
+| `list_devices` | List all devices |
+| `approve_device` | Approve a pending device |
+| `revoke_device` | Revoke a device |
+| `generate_compliance_report` | EU AI Act, SOC2, NIST AI RMF reports |
+| `get_audit_logs` | Organisation-wide audit logs |
+
+## Docs
+
+compute-id.com | hello@compute-id.com
