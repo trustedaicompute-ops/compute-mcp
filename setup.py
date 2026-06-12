@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="computeid-mcp",
-    version="1.0.0",
+    version="1.1.0",
     description="ComputeID MCP Server — cryptographic identity for AI agents via Model Context Protocol",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -28,5 +28,5 @@ setup(
         "Topic :: Security :: Cryptography",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    keywords="mcp model-context-protocol ai agents identity security computeid quantum-safe",
+    keywords="mcp model-context-protocol ai agents identity security computeid",
 )

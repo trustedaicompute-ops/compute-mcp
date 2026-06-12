@@ -4,6 +4,9 @@ ComputeID MCP Server
 Lets Claude and any MCP-compatible AI issue AgentPassports,
 manage DevicePassports, and verify identities natively.
 
+All agent tools call the live ComputeID API. Tool output reflects
+actual API responses — nothing is simulated.
+
 Install: pip install computeid-mcp
 Usage in Claude Desktop: add to claude_desktop_config.json
 """
@@ -23,6 +26,15 @@ API_URL = os.getenv("COMPUTEID_API_URL", "https://api.aicomputeid.com")
 API_TOKEN = os.getenv("COMPUTEID_TOKEN", "")
 
 server = Server("computeid")
+
+# Trust levels are convenience presets that map to explicit capability lists.
+# The capability list is what is actually stored and enforced server-side.
+TRUST_LEVEL_CAPABILITIES = {
+    "restricted": ["read"],
+    "standard": ["read", "web_browse", "api_call"],
+    "elevated": ["read", "web_browse", "api_call", "code_execute"],
+    "autonomous": ["read", "web_browse", "api_call", "code_execute", "spawn_agents"],
+}
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -47,8 +59,13 @@ async def api_patch(path: str) -> dict:
         r = await client.patch(f"{API_URL}{path}", headers=get_headers())
         return r.json()
 
+async def api_delete(path: str, data: dict = None) -> dict:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.request("DELETE", f"{API_URL}{path}", json=data or {}, headers=get_headers())
+        return r.json()
+
 def fmt_result(data: dict, success_msg: str = "") -> str:
-    if "error" in data:
+    if isinstance(data, dict) and "error" in data:
         return f"Error: {data['error']}"
     if success_msg:
         return f"{success_msg}\n\n{json.dumps(data, indent=2, default=str)}"
@@ -74,16 +91,15 @@ async def list_tools() -> list[types.Tool]:
         # ── AGENT PASSPORT ───────────────────────────────────────────────────
         types.Tool(
             name="issue_agent_passport",
-            description="""Issue a cryptographic AgentPassport to an AI agent.
-            
-An AgentPassport gives an agent:
-- A verified cryptographic identity
-- An immutable capability certificate defining what it can and cannot do
-- An audit trail that logs every action
-- An instant kill switch via revocation
+            description="""Issue an AgentPassport to an AI agent via the ComputeID API.
 
-Use this whenever you spawn, create, or deploy an AI agent that will act autonomously.
-This is the most important tool — every agent should have a passport before it acts.""",
+An AgentPassport gives an agent:
+- A registered identity with an issuer-signed registration record (RSA-SHA256)
+- A declared capability list, stored and checkable server-side
+- An audit trail of logged actions
+- Revocation support — verification reflects revoked status immediately
+
+Use this whenever you spawn, create, or deploy an AI agent that will act autonomously.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -95,14 +111,15 @@ This is the most important tool — every agent should have a passport before it
                         "type": "string",
                         "description": "Organisation or company that owns this agent e.g. 'Acme Corp'"
                     },
-                    "owner_email": {
-                        "type": "string",
-                        "description": "Email of the agent owner e.g. 'admin@acme.com'"
-                    },
                     "trust_level": {
                         "type": "string",
                         "enum": ["restricted", "standard", "elevated", "autonomous"],
-                        "description": "Trust level: restricted=read-only, standard=web+APIs, elevated=code execution, autonomous=full capabilities"
+                        "description": "Preset mapping to a capability list. restricted=[read], standard=[read, web_browse, api_call], elevated=[+code_execute], autonomous=[+spawn_agents]. You can also pass explicit capabilities instead."
+                    },
+                    "capabilities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Explicit capability list. Overrides trust_level if provided."
                     },
                     "model": {
                         "type": "string",
@@ -119,13 +136,13 @@ This is the most important tool — every agent should have a passport before it
 
         types.Tool(
             name="verify_agent_passport",
-            description="Verify whether an AI agent is trusted and its passport is valid. Use before accepting work from or delegating to another agent.",
+            description="Verify an agent's passport against the ComputeID API. Returns status (active/revoked), signature validity, and the declared capability list. Note: a revoked passport can still have a valid signature — check both fields.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "The agent ID or passport fingerprint to verify"
+                        "description": "The passport_id (UUID) returned at issuance"
                     }
                 },
                 "required": ["agent_id"]
@@ -133,14 +150,33 @@ This is the most important tool — every agent should have a passport before it
         ),
 
         types.Tool(
-            name="log_agent_action",
-            description="Log an action taken by an AI agent to its immutable audit trail. Call this after every significant action an agent takes.",
+            name="check_agent_capability",
+            description="Check whether an agent's passport grants a specific capability. Returns granted true/false with a reason. Returns granted=false with reason 'passport_revoked' if the passport has been revoked.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "The agent ID whose action to log"
+                        "description": "The passport_id (UUID) to check"
+                    },
+                    "capability": {
+                        "type": "string",
+                        "description": "Capability name to check e.g. 'read', 'web_browse', 'code_execute'"
+                    }
+                },
+                "required": ["agent_id", "capability"]
+            }
+        ),
+
+        types.Tool(
+            name="log_agent_action",
+            description="Log an action taken by an AI agent to its server-side audit trail via the ComputeID API. Call this after every significant action an agent takes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The agent's passport_id"
                     },
                     "action": {
                         "type": "string",
@@ -162,13 +198,13 @@ This is the most important tool — every agent should have a passport before it
 
         types.Tool(
             name="revoke_agent_passport",
-            description="Immediately revoke an agent's passport. This invalidates the agent across all systems instantly. Use when an agent behaves unexpectedly or needs to be stopped.",
+            description="Revoke an agent's passport via the ComputeID API. After revocation, verify_agent_passport returns status 'revoked' and check_agent_capability returns granted=false for all capabilities. Systems that check the API will see the revocation immediately; this does not by itself stop processes that never check.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "The agent ID to revoke"
+                        "description": "The passport_id to revoke"
                     },
                     "reason": {
                         "type": "string",
@@ -181,13 +217,13 @@ This is the most important tool — every agent should have a passport before it
 
         types.Tool(
             name="list_agent_passports",
-            description="List all AgentPassports in your organisation. Shows all agents, their trust levels, status, and recent activity.",
+            description="List all AgentPassports registered via the ComputeID API, with status and capabilities.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "status_filter": {
                         "type": "string",
-                        "enum": ["all", "active", "revoked", "expired"],
+                        "enum": ["all", "active", "revoked"],
                         "description": "Filter agents by status. Default: all"
                     }
                 },
@@ -197,13 +233,13 @@ This is the most important tool — every agent should have a passport before it
 
         types.Tool(
             name="get_agent_audit_log",
-            description="Get the complete audit trail for a specific agent — every action it has taken, when, and with what outcome.",
+            description="Get the server-side audit trail for a specific agent — logged actions, outcomes, and timestamps.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "The agent ID to get audit logs for"
+                        "description": "The agent's passport_id"
                     },
                     "limit": {
                         "type": "integer",
@@ -217,7 +253,7 @@ This is the most important tool — every agent should have a passport before it
         # ── DEVICE PASSPORT ──────────────────────────────────────────────────
         types.Tool(
             name="register_device",
-            description="Register a GPU, server, or other hardware device and issue a DevicePassport. Every device that runs AI workloads should have a passport.",
+            description="Register a GPU, server, or other hardware device and issue a DevicePassport.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -266,7 +302,7 @@ This is the most important tool — every agent should have a passport before it
 
         types.Tool(
             name="revoke_device",
-            description="Revoke a device's DevicePassport. This immediately removes all access for that device.",
+            description="Revoke a device's DevicePassport.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -283,39 +319,28 @@ This is the most important tool — every agent should have a passport before it
             }
         ),
 
-        # ── COMPLIANCE ───────────────────────────────────────────────────────
+        # ── REPORTING ────────────────────────────────────────────────────────
         types.Tool(
-            name="generate_compliance_report",
-            description="""Generate a compliance report for your AI infrastructure.
-            
-Supports:
-- EU AI Act Article 12 audit report
-- SOC2 Type II access control report  
-- NIST AI RMF provenance report
-- General audit summary
+            name="generate_audit_summary",
+            description="""Generate a summary of recorded identity and audit data from the ComputeID API: registered devices, agent passports, and audit log entries over a period.
 
-Returns a structured report you can share with regulators, auditors, or enterprise clients.""",
+This is a data summary to support compliance workflows (e.g. EU AI Act Article 12 record-keeping). It reports what is recorded in ComputeID — it is not a compliance certification.""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "report_type": {
-                        "type": "string",
-                        "enum": ["eu_ai_act", "soc2", "nist_ai_rmf", "general"],
-                        "description": "Type of compliance report to generate"
-                    },
                     "period_days": {
                         "type": "integer",
-                        "description": "Number of days to include in the report. Default: 30"
+                        "description": "Number of days to include in the summary. Default: 30"
                     }
                 },
-                "required": ["report_type"]
+                "required": []
             }
         ),
 
         # ── AUDIT LOGS ───────────────────────────────────────────────────────
         types.Tool(
             name="get_audit_logs",
-            description="Get the organisation-wide audit logs — all device connections and agent actions across your entire infrastructure.",
+            description="Get the organisation-wide audit logs — all device connections and agent actions recorded in ComputeID.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -340,163 +365,179 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         # STATUS
         if name == "computeid_status":
             data = await api_get("/health")
-            result = f"""✅ ComputeID API is online
+            result = f"""ComputeID API is online
 
 Status: {data.get('status', 'running')}
 API URL: {API_URL}
 Time: {data.get('time', datetime.now().isoformat())}
 Authenticated: {'Yes' if API_TOKEN else 'No — set COMPUTEID_TOKEN env var'}
 
-ComputeID MCP Server v1.0.0
-Every AI agent needs an identity. We issue them.
+ComputeID MCP Server v1.1.0
 compute-id.com"""
 
         # ISSUE AGENT PASSPORT
         elif name == "issue_agent_passport":
-            import hashlib, uuid
-            agent_id = str(uuid.uuid4())
-            fingerprint = hashlib.sha256(f"{agent_id}{arguments.get('agent_name', '')}{arguments.get('owner_org', '')}".encode()).hexdigest()[:16]
-            issued_at = datetime.now().isoformat()
             trust_level = arguments.get("trust_level", "standard")
-            capabilities = {
-                "restricted": {"can_browse_web": False, "can_execute_code": False, "can_call_apis": False, "can_spawn_agents": False, "requires_human_approval": True},
-                "standard": {"can_browse_web": True, "can_execute_code": False, "can_call_apis": True, "can_spawn_agents": False, "max_actions_per_hour": 100},
-                "elevated": {"can_browse_web": True, "can_execute_code": True, "can_call_apis": True, "can_spawn_agents": True, "max_actions_per_hour": 500},
-                "autonomous": {"can_browse_web": True, "can_execute_code": True, "can_call_apis": True, "can_spawn_agents": True, "max_actions_per_hour": -1},
-            }.get(trust_level, {})
-
-            passport = {
-                "agent_id": agent_id,
-                "fingerprint": fingerprint,
-                "agent_name": arguments.get("agent_name"),
-                "owner_org": arguments.get("owner_org"),
-                "owner_email": arguments.get("owner_email", ""),
-                "model": arguments.get("model", "unknown"),
-                "purpose": arguments.get("purpose", ""),
-                "trust_level": trust_level,
+            capabilities = arguments.get("capabilities") or TRUST_LEVEL_CAPABILITIES.get(trust_level, TRUST_LEVEL_CAPABILITIES["standard"])
+            description_parts = []
+            if arguments.get("purpose"):
+                description_parts.append(arguments["purpose"])
+            if arguments.get("model"):
+                description_parts.append(f"Model: {arguments['model']}")
+            data = await api_post("/v1/agents/register", {
+                "name": arguments.get("agent_name"),
+                "organization": arguments.get("owner_org"),
+                "description": " | ".join(description_parts),
                 "capabilities": capabilities,
-                "status": "active",
-                "issued_at": issued_at,
-                "issued_by": "ComputeID MCP Server v1.0.0",
-                "protocol": "ComputeID-AgentPassport-v1",
-                "quantum_safe": True,
-                "algorithms": ["RSA-2048", "CRYSTALS-Dilithium3", "CRYSTALS-Kyber768"],
-            }
+            })
+            if "error" in data:
+                result = f"Error issuing passport: {data['error']}"
+            else:
+                result = f"""AgentPassport issued via ComputeID API
 
-            result = f"""✅ AgentPassport issued successfully!
-
-🪪 AGENT IDENTITY
+AGENT IDENTITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Agent ID:      {agent_id}
-Fingerprint:   {fingerprint}
-Agent Name:    {arguments.get('agent_name')}
-Owner:         {arguments.get('owner_org')}
-Trust Level:   {trust_level.upper()}
-Status:        ACTIVE ✓
-Issued At:     {issued_at}
+Passport ID:   {data.get('passport_id')}
+Agent Name:    {data.get('name')}
+Owner:         {data.get('organization')}
+Status:        {str(data.get('status', '')).upper()}
+Issued At:     {data.get('issued_at')}
 
-🔒 CAPABILITIES
+CAPABILITIES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{json.dumps(capabilities, indent=2)}
+{json.dumps(data.get('capabilities', []), indent=2)}
 
-🛡️ SECURITY
+SIGNATURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Quantum-Safe:  Yes (Dilithium3 + Kyber768)
-Protocol:      ComputeID-AgentPassport-v1
-Issued By:     ComputeID MCP Server
+Algorithm:     {data.get('signature_algorithm')}
+Signature:     {str(data.get('signature', ''))[:64]}...
+(Issuer-signed registration record. Verify any time with verify_agent_passport.)
 
-⚠️  IMPORTANT: Save the agent_id — you will need it to log actions and revoke this passport.
+IMPORTANT: Save the passport_id — you will need it to verify, log actions, and revoke.
 
-To log an action: use log_agent_action with agent_id="{agent_id}"
-To revoke:        use revoke_agent_passport with agent_id="{agent_id}"
+To verify:        verify_agent_passport with agent_id="{data.get('passport_id')}"
+To log an action: log_agent_action with agent_id="{data.get('passport_id')}"
+To revoke:        revoke_agent_passport with agent_id="{data.get('passport_id')}"
 
 compute-id.com"""
 
         # VERIFY AGENT PASSPORT
         elif name == "verify_agent_passport":
             agent_id = arguments.get("agent_id", "")
-            result = f"""🔍 Agent Passport Verification
+            data = await api_get(f"/v1/agents/{agent_id}/verify")
+            if "error" in data:
+                result = f"Verification failed: {data['error']}\n\nNo passport found for ID: {agent_id}"
+            else:
+                status = str(data.get("status", "")).upper()
+                result = f"""Agent Passport Verification — ComputeID API
 
-Agent ID: {agent_id}
+Passport ID:      {data.get('passport_id')}
+Agent Name:       {data.get('name')}
+Organisation:     {data.get('organization')}
+Status:           {status}
+Signature Valid:  {data.get('signature_valid')}
+Algorithm:        {data.get('signature_algorithm')}
+Issued At:        {data.get('issued_at')}
+Revoked At:       {data.get('revoked_at') or '—'}
+Capabilities:     {', '.join(data.get('capabilities', []))}
 
-Verification Result: TRUSTED ✓
+Note: signature_valid and status are independent. A revoked passport
+retains a valid signature (it was legitimately issued); authorisation
+decisions should require status == 'active' AND signature_valid == true."""
 
-This agent has a valid ComputeID AgentPassport.
-Identity is cryptographically verified.
+        # CHECK AGENT CAPABILITY
+        elif name == "check_agent_capability":
+            agent_id = arguments.get("agent_id", "")
+            capability = arguments.get("capability", "")
+            data = await api_get(f"/v1/agents/{agent_id}/capabilities/{capability}")
+            if "error" in data:
+                result = f"Capability check failed: {data['error']}"
+            elif data.get("granted"):
+                result = f"""Capability Check — GRANTED
 
-Note: For full real-time verification, ensure your 
-COMPUTEID_TOKEN is set and the agent was issued via 
-the ComputeID API.
+Passport ID:  {agent_id}
+Capability:   {data.get('capability')}
+Scope:        {json.dumps(data.get('scope', {}))}
+Bound At:     {data.get('bound_at')}"""
+            else:
+                result = f"""Capability Check — DENIED
 
-compute-id.com"""
+Passport ID:  {agent_id}
+Capability:   {capability}
+Reason:       {data.get('reason', 'not_granted')}"""
 
         # LOG AGENT ACTION
         elif name == "log_agent_action":
             agent_id = arguments.get("agent_id")
-            action = arguments.get("action")
-            details = arguments.get("details", {})
-            outcome = arguments.get("outcome", "success")
-            timestamp = datetime.now().isoformat()
-            import hashlib
-            commitment = hashlib.sha256(f"{agent_id}{action}{timestamp}".encode()).hexdigest()[:32]
-            result = f"""📋 Action logged to immutable audit trail
+            data = await api_post(f"/v1/agents/{agent_id}/actions", {
+                "action": arguments.get("action"),
+                "details": arguments.get("details", {}),
+                "outcome": arguments.get("outcome", "success"),
+            })
+            if "error" in data:
+                result = f"Error logging action: {data['error']}"
+            else:
+                result = f"""Action logged to ComputeID audit trail
 
-Agent ID:   {agent_id}
-Action:     {action}
-Outcome:    {outcome.upper()}
-Timestamp:  {timestamp}
-Commitment: {commitment}
-Details:    {json.dumps(details)}
-
-This log entry is tamper-evident and cannot be modified.
-It will appear in all compliance reports for this agent."""
+Log ID:           {data.get('log_id')}
+Agent ID:         {data.get('agent_id')}
+Action:           {data.get('action')}
+Outcome:          {str(data.get('outcome', '')).upper()}
+Logged At:        {data.get('logged_at')}
+Passport Status:  {str(data.get('passport_status', '')).upper()}
+Details:          {json.dumps(data.get('details', {}))}"""
 
         # REVOKE AGENT PASSPORT
         elif name == "revoke_agent_passport":
             agent_id = arguments.get("agent_id")
             reason = arguments.get("reason", "No reason provided")
-            timestamp = datetime.now().isoformat()
-            result = f"""⛔ AgentPassport REVOKED
+            data = await api_delete(f"/v1/agents/{agent_id}/revoke", {"reason": reason})
+            if "error" in data:
+                result = f"Error revoking passport: {data['error']}"
+            else:
+                result = f"""AgentPassport REVOKED via ComputeID API
 
-Agent ID:   {agent_id}
-Reason:     {reason}
-Revoked At: {timestamp}
-Status:     REVOKED — all access immediately removed
+Passport ID:  {data.get('passport_id')}
+Status:       {str(data.get('status', '')).upper()}
+Reason:       {data.get('reason')}
+Revoked At:   {data.get('revoked_at')}
 
-This agent's passport is now invalid across all systems.
-Revocation has been logged to the immutable audit trail.
-This action cannot be undone."""
+verify_agent_passport now returns status 'revoked' for this passport,
+and check_agent_capability returns granted=false for all capabilities.
+Systems that check the API will see this immediately."""
 
         # LIST AGENT PASSPORTS
         elif name == "list_agent_passports":
-            try:
-                data = await api_get("/api/agents")
-                if isinstance(data, list) and len(data) > 0:
-                    lines = ["🤖 Agent Passports\n" + "━"*40]
-                    for a in data:
-                        status_icon = "✅" if a.get("status") == "active" else "⛔"
-                        lines.append(f"{status_icon} {a.get('agent_name', 'Unknown')} | {a.get('trust_level', '?').upper()} | {a.get('status', '?').upper()}")
-                    result = "\n".join(lines)
-                else:
-                    result = "No agent passports found. Issue your first one with issue_agent_passport."
-            except:
-                result = "No agent passports found yet.\n\nUse issue_agent_passport to create your first AgentPassport.\n\ncompute-id.com"
+            status_filter = arguments.get("status_filter", "all")
+            path = "/v1/agents" if status_filter == "all" else f"/v1/agents?status={status_filter}"
+            data = await api_get(path)
+            if isinstance(data, list) and len(data) > 0:
+                lines = ["Agent Passports (ComputeID API)\n" + "━"*40]
+                for a in data:
+                    marker = "[ACTIVE] " if a.get("status") == "active" else "[REVOKED]"
+                    caps = ", ".join(a.get("capabilities", []))
+                    lines.append(f"{marker} {a.get('name', 'Unknown')} | {a.get('passport_id', '?')} | {caps}")
+                result = "\n".join(lines)
+            elif isinstance(data, dict) and "error" in data:
+                result = f"Error listing passports: {data['error']}"
+            else:
+                result = "No agent passports found. Issue your first one with issue_agent_passport."
 
         # GET AGENT AUDIT LOG
         elif name == "get_agent_audit_log":
             agent_id = arguments.get("agent_id")
             limit = arguments.get("limit", 20)
-            try:
-                data = await api_get(f"/api/logs?limit={limit}")
-                if isinstance(data, list):
-                    lines = [f"📋 Audit Log for Agent {agent_id}\n" + "━"*40]
-                    for entry in data[:limit]:
-                        lines.append(f"{entry.get('created_at', '?')[:19]} | {entry.get('action', '?')} | {entry.get('status', '?').upper()}")
-                    result = "\n".join(lines)
-                else:
-                    result = f"No audit logs found for agent {agent_id}."
-            except:
-                result = f"Audit log for agent {agent_id}:\n\nNo actions logged yet. Use log_agent_action to start logging."
+            data = await api_get(f"/v1/agents/{agent_id}/actions?limit={limit}")
+            if isinstance(data, list) and len(data) > 0:
+                lines = [f"Audit Log for Agent {agent_id} (ComputeID API)\n" + "━"*40]
+                for entry in data:
+                    ts = str(entry.get("logged_at", ""))[:19]
+                    lines.append(f"{ts} | {entry.get('action', '?')} | {str(entry.get('outcome', '?')).upper()}")
+                result = "\n".join(lines)
+            elif isinstance(data, dict) and "error" in data:
+                result = f"Error fetching audit log: {data['error']}"
+            else:
+                result = f"No actions logged yet for agent {agent_id}. Use log_agent_action to start logging."
 
         # REGISTER DEVICE
         elif name == "register_device":
@@ -505,7 +546,10 @@ This action cannot be undone."""
                 "type": arguments.get("device_type", "GPU"),
                 "ip_address": arguments.get("ip_address"),
             })
-            result = f"""✅ Device registered successfully!
+            if "error" in data:
+                result = f"Error registering device: {data['error']}"
+            else:
+                result = f"""Device registered
 
 Device Code:  {data.get('device_code', 'PENDING')}
 Name:         {arguments.get('device_name')}
@@ -513,7 +557,7 @@ Type:         {arguments.get('device_type')}
 IP Address:   {arguments.get('ip_address')}
 Status:       PENDING — awaiting admin approval
 
-Next step: Approve this device using approve_device with device_code="{data.get('device_code', '')}"
+Next step: approve_device with device_code="{data.get('device_code', '')}"
 
 compute-id.com"""
 
@@ -521,13 +565,12 @@ compute-id.com"""
         elif name == "list_devices":
             data = await api_get("/api/devices")
             if isinstance(data, list) and len(data) > 0:
-                lines = ["🖥️  Registered Devices\n" + "━"*40]
+                lines = ["Registered Devices (ComputeID API)\n" + "━"*40]
                 for d in data:
-                    status_icon = "✅" if d.get("status") == "active" else "⏳" if d.get("status") == "pending" else "⛔"
-                    lines.append(f"{status_icon} {d.get('device_code', '?')} | {d.get('name', '?')} | {d.get('type', '?')} | {d.get('status', '?').upper()}")
+                    lines.append(f"{d.get('device_code', '?')} | {d.get('name', '?')} | {d.get('type', '?')} | {str(d.get('status', '?')).upper()}")
                 result = "\n".join(lines)
             else:
-                result = "No devices registered yet.\n\nUse register_device to add your first GPU or server.\n\ncompute-id.com"
+                result = "No devices registered yet. Use register_device to add your first GPU or server."
 
         # APPROVE DEVICE
         elif name == "approve_device":
@@ -536,145 +579,96 @@ compute-id.com"""
             if "error" in data:
                 result = f"Error approving device: {data['error']}"
             else:
-                result = f"✅ Device {device_code} approved and activated!\n\nThe device now has a valid DevicePassport and can authenticate to your infrastructure."
+                result = f"Device {device_code} approved and activated. The device now has an active DevicePassport."
 
         # REVOKE DEVICE
         elif name == "revoke_device":
             device_code = arguments.get("device_code")
             data = await api_patch(f"/api/devices/{device_code}/revoke")
-            result = f"⛔ Device {device_code} revoked.\n\nReason: {arguments.get('reason', 'No reason provided')}\nAll access has been immediately removed."
+            if "error" in data:
+                result = f"Error revoking device: {data['error']}"
+            else:
+                result = f"Device {device_code} revoked.\n\nReason: {arguments.get('reason', 'No reason provided')}"
 
-        # COMPLIANCE REPORT
-        elif name == "generate_compliance_report":
-            report_type = arguments.get("report_type", "general")
+        # AUDIT SUMMARY
+        elif name == "generate_audit_summary":
             period_days = arguments.get("period_days", 30)
             timestamp = datetime.now().isoformat()
 
+            device_count = 0; active_devices = 0; log_count = 0
+            agent_count = 0; active_agents = 0; revoked_agents = 0
             try:
                 devices = await api_get("/api/devices")
-                logs = await api_get(f"/api/logs?limit=100")
-                device_count = len(devices) if isinstance(devices, list) else 0
-                log_count = len(logs) if isinstance(logs, list) else 0
-                active_devices = len([d for d in devices if isinstance(d, dict) and d.get("status") == "active"]) if isinstance(devices, list) else 0
-            except:
-                device_count = 0; log_count = 0; active_devices = 0
+                if isinstance(devices, list):
+                    device_count = len(devices)
+                    active_devices = len([d for d in devices if isinstance(d, dict) and d.get("status") == "active"])
+            except Exception:
+                pass
+            try:
+                logs = await api_get("/api/logs?limit=100")
+                if isinstance(logs, list):
+                    log_count = len(logs)
+            except Exception:
+                pass
+            try:
+                agents = await api_get("/v1/agents")
+                if isinstance(agents, list):
+                    agent_count = len(agents)
+                    active_agents = len([a for a in agents if a.get("status") == "active"])
+                    revoked_agents = len([a for a in agents if a.get("status") == "revoked"])
+            except Exception:
+                pass
 
-            reports = {
-                "eu_ai_act": f"""📋 EU AI ACT ARTICLE 12 — COMPLIANCE REPORT
-{"="*50}
-Generated:     {timestamp}
-Period:        Last {period_days} days
-Organisation:  ComputeID Platform
-
-ARTICLE 12 REQUIREMENTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Input/output logging:    {log_count} audit entries recorded
-✅ Log retention:           All logs retained with tamper-evident commitments  
-✅ Decision traceability:   Full cryptographic audit trail per agent
-✅ System identification:   {active_devices} active devices with verified identity
-
-INFRASTRUCTURE SUMMARY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total Devices:    {device_count}
-Active Devices:   {active_devices}
-Audit Entries:    {log_count}
-Quantum-Safe:     Yes (CRYSTALS-Dilithium3 + Kyber768)
-
-COMPLIANCE STATUS: ✅ COMPLIANT
-This report satisfies EU AI Act Article 12 logging requirements.
-
-compute-id.com""",
-                "soc2": f"""📋 SOC2 TYPE II — ACCESS CONTROL REPORT
+            result = f"""COMPUTEID AUDIT DATA SUMMARY
 {"="*50}
 Generated:  {timestamp}
 Period:     Last {period_days} days
+Source:     {API_URL}
 
-CC6.1 LOGICAL ACCESS CONTROLS
+AGENT PASSPORTS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Unique device identities:  {device_count} devices with X.509 certificates
-✅ Access authentication:     JWT tokens with 1-hour expiry
-✅ Access revocation:         Real-time OCSP revocation <60 seconds
-✅ Audit logging:             {log_count} immutable audit entries
+Total:    {agent_count}
+Active:   {active_agents}
+Revoked:  {revoked_agents}
 
-CC7.2 SYSTEM MONITORING
+DEVICES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ All device connections logged with timestamps
-✅ All agent actions logged with cryptographic commitments
-✅ Anomaly detection via audit trail analysis
+Total:    {device_count}
+Active:   {active_devices}
 
-COMPLIANCE STATUS: ✅ SOC2 READY
-compute-id.com""",
-                "general": f"""📋 COMPUTEID COMPLIANCE SUMMARY
-{"="*50}
-Generated:  {timestamp}
-Period:     Last {period_days} days
-
-INFRASTRUCTURE
+AUDIT LOG
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Devices Registered:  {device_count}
-Active Devices:      {active_devices}
-Audit Log Entries:   {log_count}
+Entries returned (max 100): {log_count}
 
-SECURITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Certificate Type:    Hybrid X.509 + Post-Quantum
-PQC Algorithms:      CRYSTALS-Dilithium3, CRYSTALS-Kyber768
-NIST Standard:       FIPS 204, FIPS 203 (2024)
-Revocation:          OCSP real-time <60 seconds
+Identity records are issuer-signed (RSA-SHA256). Audit entries are
+stored server-side with timestamps.
 
-REGULATORY ALIGNMENT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EU AI Act Article 12:  ✅ Audit logging compliant
-NSA CNSA 2.0:          ✅ Post-quantum ready
-SOC2 Type II:          ✅ Access controls compliant
-NIST AI RMF:           ✅ Provenance tracking active
+This is a summary of data recorded in ComputeID, intended to support
+record-keeping workflows such as EU AI Act Article 12. It is not a
+compliance certification or legal assessment.
 
-compute-id.com""",
-                "nist_ai_rmf": f"""📋 NIST AI RMF — PROVENANCE REPORT
-{"="*50}
-Generated:  {timestamp}
-
-GOVERN 1.1 — AI Risk Policies
-✅ Agent capability certificates define permitted actions
-✅ Immutable audit trail enables accountability
-
-MAP 1.1 — AI Impact Categorisation  
-✅ All agents categorised by trust level
-✅ Capability boundaries cryptographically enforced
-
-MEASURE 2.5 — AI System Provenance
-✅ {device_count} devices with cryptographic identity
-✅ {log_count} provenance records in audit trail
-
-MANAGE 1.3 — Risk Response
-✅ Real-time revocation capability active
-✅ Kill switch available for all agents and devices
-
-COMPLIANCE STATUS: ✅ NIST AI RMF ALIGNED
 compute-id.com"""
-            }
-            result = reports.get(report_type, reports["general"])
 
         # GET AUDIT LOGS
         elif name == "get_audit_logs":
             limit = min(arguments.get("limit", 20), 100)
             data = await api_get(f"/api/logs?limit={limit}")
             if isinstance(data, list) and len(data) > 0:
-                lines = [f"📋 Audit Logs (last {len(data)})\n" + "━"*40]
+                lines = [f"Audit Logs (last {len(data)})\n" + "━"*40]
                 for entry in data:
                     ts = str(entry.get("created_at", ""))[:19]
-                    action = entry.get("action", "?").replace("_", " ").title()
-                    status = entry.get("status", "?").upper()
+                    action = str(entry.get("action", "?")).replace("_", " ").title()
+                    status = str(entry.get("status", "?")).upper()
                     lines.append(f"{ts} | {action} | {status}")
                 result = "\n".join(lines)
             else:
-                result = "No audit logs found yet.\n\nLogs will appear here as devices connect and agents act.\n\ncompute-id.com"
+                result = "No audit logs found yet. Logs will appear here as devices connect and agents act."
 
         else:
             result = f"Unknown tool: {name}"
 
     except Exception as e:
-        result = f"Error calling {name}: {str(e)}\n\nCheck that COMPUTEID_API_URL and COMPUTEID_TOKEN are set correctly.\n\ncompute-id.com"
+        result = f"Error calling {name}: {str(e)}\n\nCheck that COMPUTEID_API_URL is reachable and COMPUTEID_TOKEN is set correctly."
 
     return [types.TextContent(type="text", text=result)]
 
@@ -687,13 +681,13 @@ async def list_resources() -> list[types.Resource]:
         types.Resource(
             uri="computeid://docs/quickstart",
             name="ComputeID Quick Start Guide",
-            description="How to issue your first AgentPassport in 3 lines of Python",
+            description="How to issue and verify your first AgentPassport via MCP",
             mimeType="text/markdown"
         ),
         types.Resource(
             uri="computeid://docs/trust-levels",
             name="AgentPassport Trust Levels",
-            description="Explanation of restricted, standard, elevated, and autonomous trust levels",
+            description="How trust level presets map to capability lists",
             mimeType="text/markdown"
         ),
     ]
@@ -701,67 +695,55 @@ async def list_resources() -> list[types.Resource]:
 @server.read_resource()
 async def read_resource(uri: str) -> str:
     if "quickstart" in uri:
-        return """# ComputeID Quick Start
+        return """# ComputeID Quick Start (MCP)
 
-## Install
-```
-pip install computeid-sdk
-pip install computeid-cli
-```
+## 1. Check the connection
+Use the `computeid_status` tool.
 
-## Issue your first AgentPassport
-```python
-from computeid import issue_agent_passport
+## 2. Issue an AgentPassport
+Use `issue_agent_passport` with:
+- agent_name: "MyAgent"
+- owner_org: "My Company"
+- trust_level: "standard"   (or pass an explicit capabilities list)
 
-passport = issue_agent_passport(
-    agent_name="MyAgent",
-    owner_org="My Company",
-    trust_level="standard"
-)
+Save the returned passport_id.
 
-print(passport.agent_id)
-print(passport.is_trusted())  # True
+## 3. Verify it
+Use `verify_agent_passport` with the passport_id.
+Authorisation decisions should require status == "active" AND signature_valid == true.
 
-passport.log_action("web_search", {"query": "market data"})
-passport.revoke(reason="Task complete")
-```
+## 4. Check a capability
+Use `check_agent_capability` with the passport_id and a capability name.
 
-## Register a GPU
-```python
-from computeid import register_gpu
+## 5. Log actions
+Use `log_agent_action` after each significant agent action.
 
-passport = register_gpu("NVIDIA H100", "192.168.1.10")
-print(passport.device_code)  # GPU-001
-```
+## 6. Revoke when done
+Use `revoke_agent_passport`. Verification reflects revocation immediately.
 
+API reference: https://api.aicomputeid.com
 Full docs: compute-id.com
 """
     elif "trust-levels" in uri:
         return """# AgentPassport Trust Levels
 
-## restricted
-- Read-only access
-- Human approval required for every action
-- No web access, no API calls
-- Best for: sensitive data processing
+Trust levels are convenience presets in this MCP server. They map to an
+explicit capability list, which is what is stored and enforced server-side.
 
-## standard
-- Web browsing and API calls
-- No code execution
-- No spawning sub-agents
-- Best for: research, summarisation, communication
+## restricted → [read]
+Best for: sensitive data processing.
 
-## elevated  
-- Code execution permitted
-- Can spawn sub-agents
-- High action rate limit
-- Best for: engineering agents, automation
+## standard → [read, web_browse, api_call]
+Best for: research, summarisation, communication.
 
-## autonomous
-- Full capabilities
-- No action rate limit
-- Use with extreme caution
-- Best for: fully trusted, heavily audited agents
+## elevated → [read, web_browse, api_call, code_execute]
+Best for: engineering agents, automation.
+
+## autonomous → [read, web_browse, api_call, code_execute, spawn_agents]
+Use with caution. Best for: heavily audited agents.
+
+You can bypass presets entirely by passing a `capabilities` array to
+issue_agent_passport.
 
 Full docs: compute-id.com
 """
@@ -775,15 +757,15 @@ async def list_prompts() -> list[types.Prompt]:
     return [
         types.Prompt(
             name="secure_agent_deployment",
-            description="Best practice prompt for deploying an AI agent with full identity and audit infrastructure",
+            description="Best practice prompt for deploying an AI agent with identity and audit logging",
             arguments=[
                 types.PromptArgument(name="agent_purpose", description="What the agent will do", required=True),
                 types.PromptArgument(name="trust_level", description="Trust level needed", required=False),
             ]
         ),
         types.Prompt(
-            name="compliance_check",
-            description="Run a full compliance check on your AI infrastructure",
+            name="audit_review",
+            description="Review recorded identity and audit data for your AI infrastructure",
             arguments=[]
         ),
     ]
@@ -802,26 +784,26 @@ async def get_prompt(name: str, arguments: dict) -> types.GetPromptResult:
 Please help me:
 1. First check ComputeID API status with computeid_status
 2. Issue an AgentPassport with trust_level="{trust}" using issue_agent_passport
-3. Confirm the passport was issued and show me the agent_id
+3. Verify the passport with verify_agent_passport and show me the result
 4. Log the initial deployment action using log_agent_action
 5. Show me how to revoke it if needed
 
 Make sure the agent has appropriate capability boundaries for: {purpose}""")
             )]
         )
-    elif name == "compliance_check":
+    elif name == "audit_review":
         return types.GetPromptResult(
-            description="Full compliance audit",
+            description="Audit data review",
             messages=[types.PromptMessage(
                 role="user",
-                content=types.TextContent(type="text", text="""Please run a full compliance check on my ComputeID infrastructure:
+                content=types.TextContent(type="text", text="""Please review my ComputeID infrastructure data:
 
 1. Check API status with computeid_status
 2. List all devices with list_devices
 3. List all agent passports with list_agent_passports
 4. Get recent audit logs with get_audit_logs
-5. Generate an EU AI Act compliance report with generate_compliance_report
-6. Give me a summary of my current compliance posture and any gaps""")
+5. Generate an audit data summary with generate_audit_summary
+6. Summarise what is recorded and flag anything unusual (e.g. active agents with broad capabilities and no logged actions)""")
             )]
         )
     return types.GetPromptResult(description="", messages=[])
